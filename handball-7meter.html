@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7-Meter-Duell — Handball</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #10151c;
+    color: #e8ecf1;
+    font-family: "Segoe UI", Arial, sans-serif;
+    padding: 16px;
+  }
+  h1 { margin: 8px 0 2px; font-size: 28px; letter-spacing: 1px; }
+  h1 span { color: #f5a623; }
+  #sub { margin: 0 0 10px; color: #9aa7b5; font-size: 14px; }
+  #hud {
+    width: 900px;
+    max-width: 100%;
+    background: #1b2430;
+    border: 1px solid #2c3a4c;
+    border-radius: 8px 8px 0 0;
+    padding: 8px 14px;
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+  }
+  canvas {
+    display: block;
+    width: 900px;
+    max-width: 100%;
+    background: #2e8b57;
+    border: 1px solid #2c3a4c;
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+    cursor: crosshair;
+    touch-action: none;
+  }
+  #msg {
+    width: 900px;
+    max-width: 100%;
+    min-height: 24px;
+    margin-top: 10px;
+    text-align: center;
+    font-size: 17px;
+    font-weight: 600;
+    color: #ffd166;
+  }
+  #help { margin-top: 6px; color: #7f8c9b; font-size: 13px; text-align: center; }
+  kbd {
+    background: #2c3a4c;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+  <h1>7-Meter-<span>Duell</span></h1>
+  <p id="sub">Der Elfmeterschießen-Aspekt im Handball: Werfer gegen Torwart</p>
+  <div id="hud"></div>
+  <canvas id="game" width="900" height="600"></canvas>
+  <div id="msg"></div>
+  <p id="help">
+    Maus bewegen = zielen · Maustaste halten = Kraft aufladen · loslassen = werfen ·
+    <kbd>R</kbd> = Neustart
+  </p>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const hudEl = document.getElementById("hud");
+  const msgEl = document.getElementById("msg");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const goal = { x: 150, y: 70, w: 600, h: 230 };
+  const keeperRest = { x: 450, y: 300 };
+  const keeperBody = { x: 450, y: 345, r: 42 };
+  const ballStart = { x: 450, y: 550 };
+  const MAX_SHOTS = 10;
+  const SAVE_RADIUS = 58;
+
+  let state, shots, goals, power, powerDir, aim, effTarget;
+  let ball, trail, flightTime, t, keeperTarget, keeperDelay, message, msgTimer, last;
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, s) => a + (b - a) * s;
+  const easeInOut = (s) => s < 0.5 ? 2 * s * s : 1 - Math.pow(-2 * s + 2, 2) / 2;
+
+  function reset() {
+    state = "aim";
+    shots = 0;
+    goals = 0;
+    power = 0;
+    powerDir = 1;
+    aim = { x: 450, y: 150 };
+    effTarget = { x: aim.x, y: aim.y };
+    ball = { x: ballStart.x, y: ballStart.y };
+    trail = [];
+    flightTime = 0;
+    t = 0;
+    keeperTarget = { x: keeperRest.x, y: keeperRest.y };
+    keeperDelay = 0;
+    message = "Ziele mit der Maus, halte zum Aufladen — loslassen wirft!";
+    msgTimer = 0;
+    last = performance.now();
+    updateHud();
+  }
+
+  function updateHud() {
+    const quote = shots > 0 ? Math.round((goals / shots) * 100) + "%" : "—";
+    hudEl.textContent =
+      "Wurf " + Math.min(shots + 1, MAX_SHOTS) + " / " + MAX_SHOTS +
+      "   ·   Tore: " + goals +
+      "   ·   Trefferquote: " + quote;
+  }
+
+  function difficulty() {
+    return {
+      guessChance: Math.min(0.62, 0.15 + shots * 0.05),
+      reaction: Math.max(0.06, 0.30 - shots * 0.022)
+    };
+  }
+
+  function keeperZones() {
+    const xs = [goal.x + goal.w * 0.18, goal.x + goal.w * 0.5, goal.x + goal.w * 0.82];
+    const ys = [goal.y + goal.h * 0.30, goal.y + goal.h * 0.78];
+    const zones = [];
+    for (const x of xs) for (const y of ys) zones.push({ x, y });
+    return zones;
+  }
+
+  function shoot() {
+    shots++;
+    state = "fly";
+    t = 0;
+    flightTime = 1.15 - (power / 100) * 0.6;
+    const weak = power < 25;
+    effTarget = { x: aim.x, y: aim.y + (weak ? (25 - power) * 9 : 0) };
+    const d = difficulty();
+    const zones = keeperZones();
+    if (Math.random() < d.guessChance) {
+      let best = zones[0], bd = Infinity;
+      for (const z of zones) {
+        const dist = Math.hypot(z.x - aim.x, z.y - aim.y);
+        if (dist < bd) { bd = dist; best = z; }
+      }
+      keeperTarget = { x: best.x, y: best.y };
+    } else {
+      keeperTarget = zones[Math.floor(Math.random() * zones.length)];
+    }
+    keeperDelay = d.reaction * (0.7 + Math.random() * 0.6);
+    trail = [];
+    ball = { x: ballStart.x, y: ballStart.y };
+    message = "";
+    updateHud();
+  }
+
+  function keeperHandPos() {
+    const p = clamp((t - keeperDelay) / 0.32, 0, 1);
+    const e = easeInOut(p);
+    return { x: lerp(keeperRest.x, keeperTarget.x, e), y: lerp(keeperRest.y, keeperTarget.y, e) };
+  }
+
+  function insideGoal(p, margin) {
+    return p.x > goal.x + margin && p.x < goal.x + goal.w - margin &&
+           p.y > goal.y + margin && p.y < goal.y + goal.h - margin;
+  }
+
+  function finishPause(msg) {
+    message = msg;
+    msgTimer = 2.2;
+    state = "pause";
+  }
+
+  function resolveShot() {
+    if (insideGoal(effTarget, 10)) {
+      goals++;
+      finishPause("Tor! " + ["Was für ein Wurf!", "In den Winkel!", "Unhaltbar!", "Klasse platziert!"][Math.floor(Math.random() * 4)]);
+    } else if (power < 25) {
+      finishPause("Zu schwach — der Ball rollt nur halbherzig an!");
+    } else if (insideGoal(effTarget, 0)) {
+      finishPause("Am Pfosten! So knapp daneben!");
+    } else {
+      finishPause("Daneben!");
+    }
+    updateHud();
+  }
+
+  function endGame() {
+    state = "over";
+    const q = goals;
+    let rating;
+    if (q >= 8) rating = "Handball-Legende! Der Torwart hat keine Chance.";
+    else if (q >= 6) rating = "Starker Werfer!";
+    else if (q >= 4) rating = "Solider 7-Meter-Schütze.";
+    else if (q >= 2) rating = "Ausbaufähig — weiter üben!";
+    else rating = "Der Torwart gewinnt dieses Duell. Nochmal!";
+    message = "Endergebnis: " + goals + " / " + MAX_SHOTS + " Tore — " + rating + "  (R = neue Runde)";
+  }
+
+  function update(dt) {
+    if (state === "charge") {
+      power += powerDir * 150 * dt;
+      if (power >= 100) { power = 100; powerDir = -1; }
+      if (power <= 0) { power = 0; powerDir = 1; }
+    } else if (state === "fly") {
+      t += dt;
+      const s = Math.min(t / flightTime, 1);
+      ball.x = lerp(ballStart.x, effTarget.x, s);
+      ball.y = lerp(ballStart.y, effTarget.y, s) - Math.sin(Math.PI * s) * 70;
+      trail.push({ x: ball.x, y: ball.y });
+      if (trail.length > 22) trail.shift();
+      const hand = keeperHandPos();
+      const dHand = Math.hypot(ball.x - hand.x, ball.y - hand.y);
+      const dBody = Math.hypot(ball.x - keeperBody.x, ball.y - keeperBody.y);
+      if (dHand < SAVE_RADIUS || dBody < keeperBody.r) {
+        finishPause("Gehalten! Der Torwart liest deinen Wurf.");
+        return;
+      }
+      if (s >= 1) resolveShot();
+    } else if (state === "pause") {
+      msgTimer -= dt;
+      if (msgTimer <= 0) {
+        if (shots >= MAX_SHOTS) endGame();
+        else { state = "aim"; power = 0; powerDir = 1; message = "Nächster Wurf — ziele neu!"; }
+      }
+    }
+  }
+
+  function drawCourt() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#2f9e63");
+    g.addColorStop(1, "#237a4b");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(0, 470); ctx.lineTo(W, 470);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(450, 470, 90, Math.PI, 0);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(150, 600); ctx.lineTo(150, 470); ctx.lineTo(750, 470); ctx.lineTo(750, 600);
+    ctx.stroke();
+  }
+
+  function drawGoal() {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(goal.x, goal.y, goal.w, goal.h);
+    ctx.clip();
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.lineWidth = 1;
+    for (let x = goal.x; x <= goal.x + goal.w; x += 25) {
+      ctx.beginPath(); ctx.moveTo(x, goal.y); ctx.lineTo(x, goal.y + goal.h); ctx.stroke();
+    }
+    for (let y = goal.y; y <= goal.y + goal.h; y += 25) {
+      ctx.beginPath(); ctx.moveTo(goal.x, y); ctx.lineTo(goal.x + goal.w, y); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 9;
+    ctx.strokeRect(goal.x, goal.y, goal.w, goal.h);
+    ctx.strokeStyle = "rgba(0,0,0,0.25)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(goal.x + 6, goal.y + 6, goal.w - 12, goal.h - 12);
+  }
+
+  function drawKeeper() {
+    const hand = keeperHandPos();
+    ctx.strokeStyle = "#c0392b";
+    ctx.lineWidth = 16;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(432, 322); ctx.lineTo(hand.x - 18, hand.y - 8);
+    ctx.moveTo(468, 322); ctx.lineTo(hand.x + 18, hand.y - 8);
+    ctx.stroke();
+    ctx.fillStyle = "#f1c27d";
+    ctx.beginPath();
+    ctx.arc(hand.x - 18, hand.y - 8, 11, 0, Math.PI * 2);
+    ctx.arc(hand.x + 18, hand.y - 8, 11, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#c0392b";
+    ctx.beginPath();
+    ctx.ellipse(keeperBody.x, keeperBody.y, 46, 40, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#f1c27d";
+    ctx.beginPath();
+    ctx.arc(keeperBody.x, 288, 15, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#5d4037";
+    ctx.beginPath();
+    ctx.arc(keeperBody.x, 283, 15, Math.PI, 0);
+    ctx.fill();
+  }
+
+  function drawBall() {
+    for (let i = 0; i < trail.length; i++) {
+      const p = trail[i];
+      ctx.fillStyle = "rgba(255,255,255," + (i / trail.length * 0.25) + ")";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#333";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#333";
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawAim() {
+    if (state !== "aim" && state !== "charge") return;
+    ctx.strokeStyle = "#ffd166";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(aim.x, aim.y, 12, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(aim.x - 20, aim.y); ctx.lineTo(aim.x - 8, aim.y);
+    ctx.moveTo(aim.x + 8, aim.y); ctx.lineTo(aim.x + 20, aim.y);
+    ctx.moveTo(aim.x, aim.y - 20); ctx.lineTo(aim.x, aim.y - 8);
+    ctx.moveTo(aim.x, aim.y + 8); ctx.lineTo(aim.x, aim.y + 20);
+    ctx.stroke();
+    ctx.fillStyle = "#ffd166";
+    ctx.beginPath();
+    ctx.arc(aim.x, aim.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawPowerBar() {
+    if (state !== "charge") return;
+    const bw = 400, bx = (W - bw) / 2, by = H - 28;
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(bx - 4, by - 4, bw + 8, 22);
+    const hue = 120 - power * 1.2;
+    ctx.fillStyle = "hsl(" + hue + ", 85%, 50%)";
+    ctx.fillRect(bx, by, bw * (power / 100), 14);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, bw, 14);
+  }
+
+  function drawOver() {
+    if (state !== "over") return;
+    ctx.fillStyle = "rgba(0,0,0,0.65)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#ffd166";
+    ctx.textAlign = "center";
+    ctx.font = "bold 44px 'Segoe UI', Arial, sans-serif";
+    ctx.fillText("Duell beendet", W / 2, H / 2 - 50);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI', Arial, sans-serif";
+    ctx.fillText(goals + " / " + MAX_SHOTS + " Tore", W / 2, H / 2 + 5);
+    ctx.font = "20px 'Segoe UI', Arial, sans-serif";
+    ctx.fillStyle = "#9fd8ff";
+    ctx.fillText("R drücken oder klicken für ein neues Duell", W / 2, H / 2 + 60);
+  }
+
+  function render() {
+    drawCourt();
+    drawGoal();
+    drawKeeper();
+    drawBall();
+    drawAim();
+    drawPowerBar();
+    drawOver();
+    msgEl.textContent = message;
+  }
+
+  function loop(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+  }
+
+  function canvasPoint(e) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) * (W / r.width),
+      y: (e.clientY - r.top) * (H / r.height)
+    };
+  }
+
+  canvas.addEventListener("mousemove", (e) => {
+    const p = canvasPoint(e);
+    aim.x = clamp(p.x, 20, W - 20);
+    aim.y = clamp(p.y, 40, H - 60);
+  });
+
+  canvas.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    if (state === "over") { reset(); return; }
+    if (state === "aim") { state = "charge"; power = 0; powerDir = 1; }
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (state === "charge") shoot();
+  });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      if (state === "over") { reset(); return; }
+      if (state === "aim") { state = "charge"; power = 0; powerDir = 1; }
+    } else if (e.key === "r" || e.key === "R") {
+      reset();
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    if (e.code === "Space" && state === "charge") shoot();
+  });
+
+  canvas.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    const t0 = e.touches[0];
+    const p = canvasPoint(t0);
+    aim.x = clamp(p.x, 20, W - 20);
+    aim.y = clamp(p.y, 40, H - 60);
+    if (state === "over") { reset(); return; }
+    if (state === "aim") { state = "charge"; power = 0; powerDir = 1; }
+  }, { passive: false });
+
+  canvas.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    const t0 = e.touches[0];
+    const p = canvasPoint(t0);
+    aim.x = clamp(p.x, 20, W - 20);
+    aim.y = clamp(p.y, 40, H - 60);
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    if (state === "charge") shoot();
+  }, { passive: false });
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
